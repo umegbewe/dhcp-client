@@ -6,149 +6,140 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dechristopher/dhcp-client/src/models"
 )
 
+type requestContext struct {
+	mac []byte
+	ch  chan models.DHCPPacket
+}
+
 func main() {
-	// Random MAC Address
-	sampleMac := RandomMac()
-
-	fmt.Printf("~ ToyDHCP %s\n", time.Now().Format(time.RFC822))
-	fmt.Printf("~ MAC: %X\n\n", sampleMac)
-
-	// Desired IP Address command line argument
 	requestedIP := flag.String("ip4", "", "Requested IPv4 address")
+	count := flag.Int("count", 1, "Number of DHCP requests to send concurrently")
 	flag.Parse()
 
-	// Build discover packet, don't use actual interface MAC here or actual
-	// computer lease will be returned from DHCP server
-	discoverPacket := models.BuildDiscoverPacket(sampleMac, requestedIP)
+	fmt.Printf("~ ToyDHCP %s\n", time.Now().Format(time.RFC822))
+	fmt.Printf("~ Will send %d DHCP request(s)\n\n", *count)
 
-	// Server Address is the broadcast address on port 67 (255.255.255.255:67)
-	serverAddr, _ := net.ResolveUDPAddr("udp4",
-		fmt.Sprintf("%s:67", net.IP{255, 255, 255, 255}))
+	serverAddr, _ := net.ResolveUDPAddr("udp4", "255.255.255.255:67")
+	clientAddr, _ := net.ResolveUDPAddr("udp4", "0.0.0.0:68")
 
-	// Client address should be 0.0.0.0:68 (all adapters) on the local machine
-	clientAddr, _ := net.ResolveUDPAddr("udp4",
-		fmt.Sprintf("%s:68", net.IP{0, 0, 0, 0}))
-
-	// Open UDP socket to DHCP server
 	conn, err := net.ListenUDP("udp4", clientAddr)
-	// Defer UDP connection close so we can handle errors on close
-	defer func() {
-		if conn != nil {
-			err := conn.Close()
-			if err != nil {
-				fmt.Printf("UDP connection close error: %+v\n", err)
-			}
-		}
-	}()
-	// Make sure UDP dial doesn't fail
 	if err != nil {
-		fmt.Printf("UDP dial error: %+v", err)
+		fmt.Printf("UDP dial error: %v\n", err)
 		os.Exit(1)
 	}
+	defer conn.Close()
 
-	// Channel for responses
-	responses := make(chan models.DHCPPacket)
+	macCh := make(map[string]chan models.DHCPPacket)
+	requests := make([]requestContext, *count)
+	for i := 0; i < *count; i++ {
+		mac := RandomMac()                     // Our pseudo-random MAC
+		respCh := make(chan models.DHCPPacket) // Channel for receiving packets for this MAC
 
-	/*
-	 * Goroutine to listen for DHCP packets
-	 *
-	 * This doesn't HAVE to be a goroutine but starting to wait before sending
-	 * the discover packet removes the chance that we aren't ready to receive
-	 * by the time it arrives.
-	 *
-	 * Also allows for adding easier retry handling later
-	 */
-	go func() {
-		for {
-			respBuffer := make([]byte, 2048)
-			b, _, err := conn.ReadFrom(respBuffer)
-			fmt.Printf("READ: %d bytes\n\n", b)
-			//_, _, err := listener.ReadFrom(respBuffer)
-			if err != nil {
-				fmt.Printf("UDP read error  %v", err)
-				os.Exit(1)
-			}
+		macCh[string(mac)] = respCh
+		requests[i] = requestContext{mac, respCh}
+	}
 
-			packet := models.ParsePacket(respBuffer)
+	go listenForDHCPPackets(conn, macCh)
+	var wg sync.WaitGroup
+	wg.Add(*count)
 
-			// Ensure the packet is meant for us
-			if string(packet.ClientMAC) == string(sampleMac) {
-				responses <- packet
-			}
-		}
-	}()
+	// Fire off each DHCP handshake in its own goroutine
+	for i := 0; i < *count; i++ {
+		go func(rc requestContext) {
+			defer wg.Done()
+			runDHCPHandshake(conn, serverAddr, rc.mac, rc.ch, *requestedIP)
+		}(requests[i])
+	}
 
-	// Timeout and re-send DISCOVER after 5 seconds
-	timeout := time.NewTicker(time.Second * 5)
+	// Wait for all requests to complete
+	wg.Wait()
 
-	/*
-	 * If the timeout is reached, the DISCOVER is assumed to have failed and
-	 * a new one is sent, on a successful OFFER exit with success.
-	 */
+	fmt.Println("\nAll DHCP handshakes completed. Exiting.")
+}
+
+func listenForDHCPPackets(conn *net.UDPConn, macChannelMap map[string]chan models.DHCPPacket) {
+	respBuffer := make([]byte, 2048)
+
 	for {
-		// Now that we are listening for offers, send out a DISCOVER
-		_, err = conn.WriteTo(discoverPacket.Data, serverAddr)
+		n, _, err := conn.ReadFrom(respBuffer)
 		if err != nil {
-			fmt.Printf("DISCOVER write error: %+v\n", err)
-			os.Exit(1)
+			fmt.Printf("UDP read error: %v\n", err)
+			return
+		}
+		if n == 0 {
+			continue
 		}
 
-		fmt.Printf("Sent DISCOVER\n")
+		// Parse the DHCP packet
+		packet := models.ParsePacket(respBuffer[:n])
 
-		fmt.Printf("Waiting for OFFER..\n\n")
-
-		// Wait until we have an OFFER response
-		select {
-		case offer := <-responses:
-			// Pause timeout since we're in a flow
-			timeout.Stop()
-
-			fmt.Println("OFFER received!")
-			fmt.Printf("\n%+v\n", offer)
-
-			// Print what server offered
-			fmt.Printf("Server offered: %s", net.IP(offer.YourIP))
-			if net.IP(offer.YourIP).String() == *requestedIP {
-				fmt.Printf(" (our requested IP!)\n")
-			} else {
-				fmt.Println()
-			}
-
-			// Build the REQUEST packet given the server's response
-			request := models.BuildRequestPacket(sampleMac, offer.YourIP, offer.ServerIP)
-
-			// Send REQUEST
-			_, err := conn.WriteTo(request.Data, serverAddr)
-			if err != nil {
-				fmt.Printf("REQUEST write error: %+v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Printf("Sent REQUEST for IP: %s\n\n", net.IP(offer.YourIP))
-			fmt.Printf("Waiting for ACK..\n\n")
-
-			// Pull ACK packet
-			ack := <-responses
-
-			// Make sure we have a positive acknowledge
-			if ack.DHCPMessageType == models.ACKNOWLEDGE {
-				fmt.Println("ACK received!")
-				fmt.Printf("\n%+v\n", ack)
-				fmt.Printf("Leased IP: %s", net.IP(ack.YourIP))
-			} else {
-				fmt.Println("Uh-oh! NACK received!")
-				fmt.Printf("NACK: \n%+v\n", ack)
-			}
-
-			os.Exit(0)
-		case <-timeout.C:
-			fmt.Println("DISCOVER timeout, resending DISCOVER")
+		// Match this packet’s ClientMAC to one of our request contexts
+		macStr := string(packet.ClientMAC)
+		if ch, ok := macChannelMap[macStr]; ok {
+			// Forward packet to the specific goroutine waiting on this MAC
+			ch <- packet
+		} else {
+			// If we get here, the packet doesn’t match any known MAC
 		}
+	}
+}
+
+func runDHCPHandshake(
+	conn *net.UDPConn,
+	serverAddr *net.UDPAddr,
+	mac []byte,
+	respCh chan models.DHCPPacket,
+	requestedIP string,
+) {
+	// Build a DISCOVER packet for this unique MAC
+	discoverPacket := models.BuildDiscoverPacket(mac, &requestedIP)
+
+	// Send DISCOVER
+	_, err := conn.WriteTo(discoverPacket.Data, serverAddr)
+	if err != nil {
+		fmt.Printf("DISCOVER write error (MAC %X): %v\n", mac, err)
+		return
+	}
+	fmt.Printf("[MAC %X] Sent DISCOVER\n", mac)
+
+	// Wait for OFFER (with timeout)
+	offer, ok := waitForPacket(respCh, 5*time.Second)
+	if !ok || offer.DHCPMessageType != models.OFFER {
+		fmt.Printf("[MAC %X] Timed out or did not receive valid OFFER\n", mac)
+		return
+	}
+	fmt.Printf("[MAC %X] Received OFFER for IP %s\n", mac, net.IP(offer.YourIP))
+
+	// Build and send REQUEST
+	request := models.BuildRequestPacket(mac, offer.YourIP, offer.ServerIP)
+	_, err = conn.WriteTo(request.Data, serverAddr)
+	if err != nil {
+		fmt.Printf("[MAC %X] REQUEST write error: %v\n", mac, err)
+		return
+	}
+	fmt.Printf("[MAC %X] Sent REQUEST for IP %s\n", mac, net.IP(offer.YourIP))
+
+	// Wait for ACK
+	ack, ok := waitForPacket(respCh, 5*time.Second)
+	if !ok || ack.DHCPMessageType != models.ACKNOWLEDGE {
+		fmt.Printf("[MAC %X] Timed out or did not receive ACK\n", mac)
+		return
+	}
+	fmt.Printf("[MAC %X] Received ACK - Leased IP %s\n", mac, net.IP(ack.YourIP))
+}
+
+func waitForPacket(ch chan models.DHCPPacket, timeout time.Duration) (models.DHCPPacket, bool) {
+	select {
+	case pkt := <-ch:
+		return pkt, true
+	case <-time.After(timeout):
+		return models.DHCPPacket{}, false
 	}
 }
 
