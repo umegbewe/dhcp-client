@@ -15,12 +15,12 @@ import (
 	"github.com/dechristopher/dhcp-client/src/models"
 )
 
-
 type handshakeResult struct {
 	success      bool          // Did we get an ACK?
 	elapsed      time.Duration // Time from DISCOVER to ACK
 	offeredIP    net.IP        // IP offered by the server
 	acknowledged bool          // True if final packet was an ACK
+	errReason string           // why failed if it did
 }
 
 func main() {
@@ -160,11 +160,15 @@ func runDHCPHandshake(
 
 	// Wait for OFFER
 	offer, ok := waitForPacket(respCh, stepTimeout)
-	if !ok || offer.DHCPMessageType != models.OFFER {
-		fmt.Printf("[MAC %X] No valid OFFER (timeout or mismatch)\n", mac)
-		return result
-	}
-	result.offeredIP = net.IP(offer.YourIP)
+    if !ok {
+        result.errReason = "Timeout waiting for OFFER"
+        return result
+    }
+    if offer.DHCPMessageType != models.OFFER {
+        result.errReason = fmt.Sprintf("Expected OFFER, got %v", offer.DHCPMessageType)
+        return result
+    }
+    result.offeredIP = net.IP(offer.YourIP)
 
 	// Send REQUEST
 	request := models.BuildRequestPacket(mac, offer.YourIP, offer.ServerIP)
@@ -175,9 +179,17 @@ func runDHCPHandshake(
 
 	// Wait for ACK
 	ack, ok := waitForPacket(respCh, stepTimeout)
-	if !ok || ack.DHCPMessageType != models.ACKNOWLEDGE {
-		fmt.Printf("[MAC %X] No valid ACK (timeout or mismatch)\n", mac)
-		return result
+    if !ok {
+        result.errReason = "Timeout waiting for ACK"
+        return result
+    }
+    if ack.DHCPMessageType == models.NACKNOWLEDGE {
+        result.errReason = "Server returned NACK"
+        return result
+    }
+    if ack.DHCPMessageType != models.ACKNOWLEDGE {
+        result.errReason = fmt.Sprintf("Expected ACK, got %v", ack.DHCPMessageType)
+        return result
 	}
 
 	result.success = true
@@ -220,41 +232,54 @@ func summarizeResults(results []handshakeResult, total time.Duration) {
 	var successCount, failCount int
 	var minDur, maxDur time.Duration
 	var totalDur time.Duration
+	failReasons := make(map[string]int)
 
 	minDur = time.Hour // something large
 	for _, r := range results {
-		if r.acknowledged {
-			successCount++
-			if r.elapsed < minDur {
-				minDur = r.elapsed
-			}
-			if r.elapsed > maxDur {
-				maxDur = r.elapsed
-			}
-			totalDur += r.elapsed
-		} else {
-			failCount++
-		}
-	}
+        if r.success {
+            successCount++
+            if r.elapsed < minDur {
+                minDur = r.elapsed
+            }
+            if r.elapsed > maxDur {
+                maxDur = r.elapsed
+            }
+            totalDur += r.elapsed
+        } else {
+            failCount++
+            if r.errReason == "" {
+                failReasons["UNKNOWN"]++
+            } else {
+                failReasons[r.errReason]++
+            }
+        }
+    }
+
+	if failCount > 0 {
+        fmt.Printf("\nFailure reasons:\n")
+        for reason, count := range failReasons {
+            fmt.Printf("  %d - %s\n", count, reason)
+        }
+    }
 
 	fmt.Printf("\n====== DHCP BENCHMARK SUMMARY ======\n")
-	fmt.Printf("Hardware Info: OS=%s, ARCH=%s, CPUs=%d\n", osName, arch, numCPU)
-	fmt.Printf("Total requests:    %d\n", len(results))
-	fmt.Printf("Successful ACKs:   %d\n", successCount)
-	fmt.Printf("Failures/timeouts: %d\n", failCount)
-	fmt.Printf("Wall-clock time:   %v\n", total)
+    fmt.Printf("Hardware Info: OS=%s, ARCH=%s, CPUs=%d\n", osName, arch, numCPU)
+    fmt.Printf("Total requests:    %d\n", len(results))
+    fmt.Printf("Successful ACKs:   %d\n", successCount)
+    fmt.Printf("Failures/timeouts: %d\n", failCount)
+    fmt.Printf("Wall-clock time:   %v\n", total)
 
 	if successCount > 0 {
-		avgDur := time.Duration(int64(totalDur) / int64(successCount))
-		fmt.Printf("Min handshake time: %v\n", minDur)
-		fmt.Printf("Avg handshake time: %v\n", avgDur)
-		fmt.Printf("Max handshake time: %v\n", maxDur)
+        avgDur := time.Duration(int64(totalDur) / int64(successCount))
+        fmt.Printf("\nMin handshake time: %v\n", minDur)
+        fmt.Printf("Avg handshake time: %v\n", avgDur)
+        fmt.Printf("Max handshake time: %v\n", maxDur)
 
-		// Approx RPS (only for successful ACKs)
-		rps := float64(successCount) / total.Seconds()
-		fmt.Printf("Approx throughput: %.2f requests/sec (ACKed only)\n", rps)
-	} else {
-		fmt.Println("No successful handshakes to compute timing.")
-	}
-	fmt.Println("====================================")
+        rps := float64(successCount) / total.Seconds()
+        fmt.Printf("Approx throughput: %.2f requests/sec (ACKed only)\n", rps)
+    } else {
+        fmt.Println("\nNo successful handshakes to compute timing.")
+    }
+
+    fmt.Println("====================================")
 }
